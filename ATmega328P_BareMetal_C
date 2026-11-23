@@ -1,0 +1,241 @@
+%Tentative Code 
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+
+#define ICR1_TOP      39999U
+#define AZ_MIN        2000U
+#define AZ_MAX        4000U
+#define AZ_SAFE       3000U
+#define AZ_STEP       10U
+
+#define EL_MIN        16U
+#define EL_MAX        31U
+#define EL_SAFE       23U
+
+#define DEADBAND_AZ   50U
+#define DEADBAND_EL   100U
+
+#define ALERT_RAIN    'R'
+#define ALERT_CLEAR   'C'
+
+static void system_init(void) {
+    DDRB = 0x2A;
+    PORTB = 0x00;
+
+    DDRC = 0x00;
+    PORTC = 0x00;
+
+    DDRD = 0x02;
+    PORTD = 0x04;
+
+    DIDR0 = 0x0F;
+    ADMUX = 0x40;
+    ADCSRA = 0x87;
+
+    UBRR0H = 0;
+    UBRR0L = 103;
+    UCSR0A = 0x00;
+    UCSR0B = 0x18;
+    UCSR0C = 0x06;
+
+    ICR1 = ICR1_TOP;
+    OCR1A = AZ_SAFE;
+    TCCR1A = 0x82;
+    TCCR1B = 0x1A;
+
+    OCR2A = EL_SAFE;
+    TCCR2A = 0x83;
+    TCCR2B = 0x07;
+}
+
+static uint16_t adc_read(uint8_t channel) {
+    uint8_t i;
+    uint16_t low;
+    uint16_t high;
+
+    ADMUX = 0x40 | (channel & 0x07);
+    for (i = 0; i < 2; i++) {
+        ADCSRA = 0xC7;
+        while (!(ADCSRA & (1 << ADIF))) {
+        }
+        ADCSRA = 0x97;
+    }
+
+    low = ADCL;
+    high = ADCH;
+    return (high << 8) | low;
+}
+
+static void uart_tx_char(char c) {
+    while (!(UCSR0A & (1 << UDRE0))) {
+    }
+    UDR0 = (uint8_t)c;
+}
+
+static void uart_tx_uint(uint16_t val) {
+    char buf[6];
+    uint8_t i = 0;
+
+    if (val == 0) {
+        uart_tx_char('0');
+        return;
+    }
+
+    while (val > 0) {
+        buf[i++] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+
+    while (i > 0) {
+        uart_tx_char(buf[--i]);
+    }
+}
+
+static void uart_rx_poll(uint8_t *uart_safe) {
+    uint8_t status;
+    uint8_t data;
+
+    if (!(UCSR0A & (1 << RXC0))) {
+        return;
+    }
+
+    status = UCSR0A;
+    data = UDR0;
+
+    if (status & 0x1C) {
+        return;
+    }
+
+    if (data == ALERT_RAIN) {
+        *uart_safe = 1;
+    } else if (data == ALERT_CLEAR) {
+        *uart_safe = 0;
+    }
+}
+
+static void delay_20ms_poll(uint8_t *uart_safe) {
+    uint8_t i;
+    for (i = 0; i < 20; i++) {
+        _delay_ms(1);
+        uart_rx_poll(uart_safe);
+    }
+}
+
+static void send_telemetry(uint16_t az_pos, uint8_t el_pos,
+                           uint16_t tl, uint16_t tr, uint16_t bl, uint16_t br,
+                           uint8_t moved, uint8_t active_mode) {
+    uint16_t az_deg = (uint16_t)(((uint32_t)(az_pos - AZ_MIN) * 180UL) / (AZ_MAX - AZ_MIN));
+    uint16_t el_deg = (uint16_t)(((uint16_t)(el_pos - EL_MIN) * 180U) / (EL_MAX - EL_MIN));
+    uint16_t avg_ldr = (tl + tr + bl + br) >> 2;
+    uint16_t light_pct = (uint16_t)(((uint32_t)avg_ldr * 100UL) / 1023UL);
+
+    uart_tx_char('$');
+    uart_tx_uint(az_deg);
+    uart_tx_char(',');
+    uart_tx_uint(el_deg);
+    uart_tx_char(',');
+    uart_tx_uint(tl);
+    uart_tx_char(',');
+    uart_tx_uint(tr);
+    uart_tx_char(',');
+    uart_tx_uint(bl);
+    uart_tx_char(',');
+    uart_tx_uint(br);
+    uart_tx_char(',');
+    uart_tx_uint(light_pct);
+    uart_tx_char(',');
+    uart_tx_uint(moved);
+    uart_tx_char(',');
+    uart_tx_uint(active_mode);
+    uart_tx_char('\r');
+    uart_tx_char('\n');
+}
+
+int main(void) {
+    uint16_t az_pos = AZ_SAFE;
+    uint8_t el_pos = EL_SAFE;
+    uint8_t uart_safe = 0;
+    uint8_t active_mode = 0;
+    uint8_t tick = 0;
+    uint8_t tx_tick = 0;
+    uint8_t moved = 0;
+
+    uint16_t tl, tr, bl, br;
+    uint16_t left, right, top, bottom;
+
+    system_init();
+
+    while (1) {
+        uart_rx_poll(&uart_safe);
+
+        tl = adc_read(0);
+        tr = adc_read(1);
+        bl = adc_read(2);
+        br = adc_read(3);
+
+        if ((!(PIND & (1 << PD2))) || (uart_safe == 1)) {
+            active_mode = 1;
+            if ((az_pos != AZ_SAFE) || (el_pos != EL_SAFE)) {
+                moved = 1;
+            }
+            az_pos = AZ_SAFE;
+            el_pos = EL_SAFE;
+            PORTB |= (1 << PB5);
+        } else {
+            active_mode = 0;
+            PORTB &= ~(1 << PB5);
+
+            left = tl + bl;
+            right = tr + br;
+            top = tl + tr;
+            bottom = bl + br;
+
+            if (left > (right + DEADBAND_AZ)) {
+                if (az_pos > (AZ_MIN + AZ_STEP)) {
+                    az_pos -= AZ_STEP;
+                } else {
+                    az_pos = AZ_MIN;
+                }
+                moved = 1;
+            } else if (right > (left + DEADBAND_AZ)) {
+                if ((az_pos + AZ_STEP) < AZ_MAX) {
+                    az_pos += AZ_STEP;
+                } else {
+                    az_pos = AZ_MAX;
+                }
+                moved = 1;
+            }
+
+            tick++;
+            if ((tick & 0x07) == 0) {
+                if (top > (bottom + DEADBAND_EL)) {
+                    if (el_pos < EL_MAX) {
+                        el_pos++;
+                        moved = 1;
+                    }
+                } else if (bottom > (top + DEADBAND_EL)) {
+                    if (el_pos > EL_MIN) {
+                        el_pos--;
+                        moved = 1;
+                    }
+                }
+            }
+        }
+
+        OCR1A = az_pos;
+        OCR2A = el_pos;
+
+        tx_tick++;
+        if (tx_tick >= 50) {
+            tx_tick = 0;
+            send_telemetry(az_pos, el_pos, tl, tr, bl, br, moved, active_mode);
+            moved = 0;
+        }
+
+        delay_20ms_poll(&uart_safe);
+    }
+}
